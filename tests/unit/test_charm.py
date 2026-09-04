@@ -5,10 +5,12 @@
 
 """Unit tests for the Vaultlocker charm."""
 
+import configparser
 import json
 
 from ops import testing
 
+import vaultlocker
 from charm import NONCE_SECRET_LABEL
 
 NONCE = "test-nonce"
@@ -44,6 +46,17 @@ def ready_vault_kv_relation():
     )
 
 
+def vault_kv_credentials_secret():
+    """Return AppRole credentials shared by the vault provider."""
+    return testing.Secret(
+        {
+            "role-id": "test-role-id",
+            "role-secret-id": "test-role-secret-id",
+        },
+        id="secret:credentials",
+    )
+
+
 class TestVaultlockerCharm:
     """Test charm lifecycle and relation handling."""
 
@@ -76,27 +89,55 @@ class TestVaultlockerCharm:
         assert state_out.unit_status == WAITING
 
     def test_vault_kv_complete_data_sets_active(self, ctx):
-        """Complete Vault information changes Waiting to Active."""
+        """Ready reads the latest credentials and changes Waiting to Active."""
         relation = ready_vault_kv_relation()
+        latest_content = {
+            "role-id": "test-role-id",
+            "role-secret-id": "updated-role-secret-id",
+        }
+        credentials = testing.Secret(
+            {
+                "role-id": "test-role-id",
+                "role-secret-id": "old-role-secret-id",
+            },
+            latest_content=latest_content,
+            id="secret:credentials",
+        )
         state_in = testing.State(
             relations=[relation],
-            secrets=[vault_kv_nonce_secret()],
+            secrets=[vault_kv_nonce_secret(), credentials],
             unit_status=WAITING,
         )
 
-        state_out = ctx.run(ctx.on.relation_changed(relation, remote_unit=0), state_in)
+        state_out = ctx.run(
+            ctx.on.relation_changed(relation, remote_unit=0),
+            state_in,
+        )
 
+        config_dir = vaultlocker.CONFIG_PATH / "vaultlocker"
+        ca_path = config_dir / "vault-ca.pem"
+        config = configparser.ConfigParser()
+        config.read(config_dir / "vaultlocker.conf")
+
+        assert ca_path.read_text(encoding="utf-8") == "test-ca-certificate"
+        assert dict(config["vault"]) == {
+            "url": "https://vault.example.com:8200",
+            "approle": "test-role-id",
+            "secret_id": "updated-role-secret-id",
+            "backend": "charm-vaultlocker-keys",
+            "kv_version": "2",
+            "ca_bundle": str(ca_path),
+        }
         assert state_out.unit_status == ACTIVE
 
     def test_vault_kv_subnet_change_updates_request(self, ctx):
         """A network change updates the Vault request using the existing nonce."""
         relation = ready_vault_kv_relation()
-        secret = vault_kv_nonce_secret()
         network = testing.Network("vault-kv", egress_subnets=["10.1.0.0/24"])
         state_in = testing.State(
             relations=[relation],
             networks=[network],
-            secrets=[secret],
+            secrets=[vault_kv_nonce_secret(), vault_kv_credentials_secret()],
             unit_status=ACTIVE,
         )
 

@@ -10,6 +10,8 @@ import secrets
 import ops
 from charms.vault_k8s.v0 import vault_kv
 
+import vaultlocker
+
 logger = logging.getLogger(__name__)
 
 VAULT_KV_RELATION = "vault-kv"
@@ -35,6 +37,10 @@ class VaultlockerCharm(ops.CharmBase):
             self._on_vault_kv_connected,
         )
         framework.observe(
+            self.vault_kv.on.ready,
+            self._on_vault_kv_ready,
+        )
+        framework.observe(
             self.on.update_status,
             self._on_update_status,
         )
@@ -50,6 +56,30 @@ class VaultlockerCharm(ops.CharmBase):
     def _on_vault_kv_connected(self, event: vault_kv.VaultKvConnectedEvent):
         """Handle a connected vault-kv relation."""
         self._request_vault_credentials(event.relation)
+
+    def _on_vault_kv_ready(self, event: vault_kv.VaultKvReadyEvent):
+        """Handle the vault-kv relation ready."""
+        relation = event.relation
+
+        vault_url = self.vault_kv.get_vault_url(relation)
+        ca_certificate = self.vault_kv.get_ca_certificate(relation)
+        mount = self.vault_kv.get_mount(relation)
+
+        if vault_url is None or ca_certificate is None or mount is None:
+            return
+
+        credentials = self._get_vault_credentials(relation, refresh=True)
+        if credentials is None:
+            return
+
+        vaultlocker.write_vault_configuration(
+            vaultlocker.CONFIG_PATH / self.app.name,
+            vault_url=vault_url,
+            ca_certificate=ca_certificate,
+            mount=mount,
+            role_id=credentials["role-id"],
+            role_secret_id=credentials["role-secret-id"],
+        )
 
     def _on_update_status(self, _: ops.UpdateStatusEvent):
         """Handle status updates.."""
@@ -71,6 +101,10 @@ class VaultlockerCharm(ops.CharmBase):
             or not self.vault_kv.get_unit_credentials(relation)
         ):
             event.add_status(ops.WaitingStatus("Waiting for Vault information"))
+            return
+
+        if self._get_vault_credentials(relation) is None:
+            event.add_status(ops.WaitingStatus("Waiting for Vault credentials"))
             return
 
         event.add_status(ops.ActiveStatus("Vault integration ready"))
@@ -103,6 +137,26 @@ class VaultlockerCharm(ops.CharmBase):
             return nonce
 
         return secret.get_content(refresh=True)["nonce"]
+
+    def _get_vault_credentials(
+        self, relation: ops.Relation, refresh: bool = False
+    ) -> dict[str, str] | None:
+        """Return this unit's approle credentials when available."""
+        secret_id = self.vault_kv.get_unit_credentials(relation)
+        if not secret_id:
+            return None
+
+        try:
+            secret = self.model.get_secret(id=secret_id)
+            content = secret.get_content(refresh=refresh)
+        except ops.ModelError as e:
+            logger.warning("Unable to read vault AppRole credentials: %s", e)
+            return None
+
+        if not content.get("role-id") or not content.get("role-secret-id"):
+            return None
+
+        return content
 
 
 if __name__ == "__main__":  # pragma: nocover
