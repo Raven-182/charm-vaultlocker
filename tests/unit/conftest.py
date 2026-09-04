@@ -6,12 +6,15 @@
 import pytest
 from ops import testing
 
+import vaultlocker
 from charm import VaultlockerCharm
 
 
 @pytest.fixture
-def ctx() -> testing.Context:
+def ctx(monkeypatch, tmp_path) -> testing.Context:
     """Return a fresh charm context."""
+    monkeypatch.setattr(vaultlocker, "CONFIG_PATH", tmp_path)
+
     return testing.Context(
         VaultlockerCharm,
         meta={
