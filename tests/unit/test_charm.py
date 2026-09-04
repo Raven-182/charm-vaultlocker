@@ -174,3 +174,32 @@ class TestVaultlockerCharm:
         state_out = ctx.run(ctx.on.relation_broken(relation), state_in)
 
         assert state_out.unit_status == BLOCKED
+
+    def test_vault_kv_credentials_changed_updates_config(self, ctx):
+        """A new credential revision updates the Vaultlocker configuration."""
+        latest_credentials = {
+            "role-id": "test-role-id",
+            "role-secret-id": "new-role-secret-id",
+        }
+        credentials = testing.Secret(
+            {
+                "role-id": "test-role-id",
+                "role-secret-id": "old-role-secret-id",
+            },
+            latest_content=latest_credentials,
+            id="secret:credentials",
+        )
+        relation = ready_vault_kv_relation()
+        state_in = testing.State(
+            relations=[relation],
+            secrets=[vault_kv_nonce_secret(), credentials],
+            unit_status=ACTIVE,
+        )
+
+        state_out = ctx.run(ctx.on.secret_changed(credentials), state_in)
+
+        config = configparser.ConfigParser()
+        config.read(vaultlocker.CONFIG_PATH / "vaultlocker" / "vaultlocker.conf")
+
+        assert config["vault"]["secret_id"] == "new-role-secret-id"
+        assert state_out.get_secret(id=credentials.id).tracked_content == latest_credentials
