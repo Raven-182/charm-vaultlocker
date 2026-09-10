@@ -24,6 +24,7 @@ def ctx(monkeypatch, tmp_path) -> testing.Context:
                 "encrypted-device": {
                     "interface": "encrypted-device",
                     "scope": "container",
+                    "limit": 1,
                 },
                 "vault-kv": {
                     "interface": "vault-kv",

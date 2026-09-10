@@ -9,12 +9,17 @@ import secrets
 
 import ops
 from charms.vault_k8s.v0 import vault_kv
+from vaultlocker_interfaces.encrypted_device import (
+    DeviceRequestsChangedEvent,
+    EncryptedDeviceRequires,
+)
 
 import vaultlocker
 
 logger = logging.getLogger(__name__)
 
 VAULT_KV_RELATION = "vault-kv"
+ENCRYPTED_DEVICE_RELATION = "encrypted-device"
 VAULT_KV_MOUNT_SUFFIX = "keys"
 NONCE_SECRET_LABEL = "vault-kv-nonce"
 
@@ -30,6 +35,10 @@ class VaultlockerCharm(ops.CharmBase):
             VAULT_KV_RELATION,
             VAULT_KV_MOUNT_SUFFIX,
         )
+        self.encrypted_device = EncryptedDeviceRequires(
+            self,
+            ENCRYPTED_DEVICE_RELATION,
+        )
 
         framework.observe(self.on.install, self._on_install)
         framework.observe(
@@ -39,6 +48,10 @@ class VaultlockerCharm(ops.CharmBase):
         framework.observe(
             self.vault_kv.on.ready,
             self._on_vault_kv_ready,
+        )
+        framework.observe(
+            self.encrypted_device.on.requests_changed,
+            self._on_device_requests_changed,
         )
         framework.observe(
             self.on.secret_changed,
@@ -52,6 +65,10 @@ class VaultlockerCharm(ops.CharmBase):
             self.on.collect_unit_status,
             self._on_collect_vault_status,
         )
+        framework.observe(
+            self.on.collect_unit_status,
+            self._on_collect_encrypted_device_status,
+        )
 
     def _on_install(self, _: ops.InstallEvent):
         """Handle charm installation."""
@@ -64,6 +81,30 @@ class VaultlockerCharm(ops.CharmBase):
     def _on_vault_kv_ready(self, event: vault_kv.VaultKvReadyEvent):
         """Handle the vault-kv relation ready."""
         self._write_vault_config(event.relation)
+
+    def _on_device_requests_changed(self, event: DeviceRequestsChangedEvent):
+        """Handle changed encrypted-device requests."""
+        if event.unit is None:
+            return
+
+        try:
+            requests = self.encrypted_device.get_device_requests(
+                event.relation,
+                event.unit,
+            )
+        except ValueError as error:
+            logger.warning(
+                "Invalid encrypted-device requests from %s: %s",
+                event.unit.name,
+                error,
+            )
+            return
+
+        logger.info(
+            "Received %d encrypted-device request(s) from %s",
+            len(requests),
+            event.unit.name,
+        )
 
     def _on_secret_changed(self, event: ops.SecretChangedEvent):
         """Update configuration when the Vault credentials change."""
@@ -104,6 +145,27 @@ class VaultlockerCharm(ops.CharmBase):
             return
 
         event.add_status(ops.ActiveStatus("Vault integration ready"))
+
+    def _on_collect_encrypted_device_status(self, event: ops.CollectStatusEvent):
+        """Report status for encrypted-device relation."""
+        relation = self.model.get_relation(ENCRYPTED_DEVICE_RELATION)
+
+        if relation is None or not relation.active:
+            return
+
+        principal_unit = next(iter(relation.units), None)
+        if principal_unit is None:
+            return
+
+        try:
+            self.encrypted_device.get_device_requests(
+                relation,
+                principal_unit,
+            )
+        except ValueError:
+            event.add_status(
+                ops.BlockedStatus(f"Invalid encrypted-device requests from {principal_unit.name}")
+            )
 
     def _request_vault_credentials(self, relation: ops.Relation):
         """Request credentials for this unit."""
