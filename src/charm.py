@@ -81,29 +81,57 @@ class VaultlockerCharm(ops.CharmBase):
     def _on_vault_kv_ready(self, event: vault_kv.VaultKvReadyEvent):
         """Handle the vault-kv relation ready."""
         self._write_vault_config(event.relation)
+        self._reconcile_encrypted_device_requests()
 
     def _on_device_requests_changed(self, event: DeviceRequestsChangedEvent):
         """Handle changed encrypted-device requests."""
         if event.unit is None:
             return
+        self._reconcile_encrypted_device_requests()
+
+    def _reconcile_encrypted_device_requests(self):
+        """Reconcile the encrypted-device requests with the current state."""
+        device_relation = self.model.get_relation(ENCRYPTED_DEVICE_RELATION)
+        if device_relation is None or not device_relation.active:
+            return
+
+        requesting_unit = next(iter(device_relation.units), None)
+        if requesting_unit is None:
+            return
 
         try:
             requests = self.encrypted_device.get_device_requests(
-                event.relation,
-                event.unit,
+                device_relation,
+                requesting_unit,
             )
         except ValueError as error:
             logger.warning(
                 "Invalid encrypted-device requests from %s: %s",
-                event.unit.name,
+                requesting_unit.name,
                 error,
             )
             return
 
+        vault_relation = self.model.get_relation(VAULT_KV_RELATION)
+
+        # Can not process device requests without a valid vault relation
+        if vault_relation is None or not vault_relation.active or vault_relation.app is None:
+            return
+
+        if not vault_kv.is_provider_data_valid(vault_relation.data[vault_relation.app]):
+            return
+
+        if self._get_vault_credentials(vault_relation) is None:
+            return
+
+        config_path = vaultlocker.CONFIG_PATH / self.app.name / "vaultlocker.conf"
+        if not config_path.is_file():
+            return
+
         logger.info(
-            "Received %d encrypted-device request(s) from %s",
+            "%d device request(s) from %s will be processed",
             len(requests),
-            event.unit.name,
+            requesting_unit.name,
         )
 
     def _on_secret_changed(self, event: ops.SecretChangedEvent):
@@ -117,6 +145,7 @@ class VaultlockerCharm(ops.CharmBase):
             return
 
         self._write_vault_config(relation)
+        self._reconcile_encrypted_device_requests()
 
     def _on_update_status(self, _: ops.UpdateStatusEvent):
         """Handle status updates.."""
