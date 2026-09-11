@@ -6,16 +6,25 @@
 
 import logging
 import secrets
+from pathlib import Path
 
 import ops
 from charmlibs import snap
 from charms.vault_k8s.v0 import vault_kv
 from vaultlocker_interfaces.encrypted_device import (
     DeviceRequestsChangedEvent,
+    DeviceResult,
     EncryptedDeviceRequires,
 )
 
 import vaultlocker
+import vaultlocker_cli
+from local_metadata import (
+    REQUEST_TYPE_ENCRYPT,
+    REQUEST_TYPE_ENROLL,
+    STATE_FILE_NAME,
+    LocalMetadataStore,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +42,7 @@ class VaultlockerCharm(ops.CharmBase):
     def __init__(self, framework: ops.Framework):
         super().__init__(framework)
 
+        self._metadata = LocalMetadataStore(self._application_config_dir() / STATE_FILE_NAME)
         self.vault_kv = vault_kv.VaultKvRequires(
             self,
             VAULT_KV_RELATION,
@@ -76,6 +86,10 @@ class VaultlockerCharm(ops.CharmBase):
         """Handle charm installation."""
         self._get_or_create_nonce()
         self._install_vaultlocker_snap()
+
+    def _application_config_dir(self) -> Path:
+        """Return the directory used to store this application's vaultlocker files."""
+        return vaultlocker.CONFIG_PATH / self.app.name
 
     def _install_vaultlocker_snap(self) -> None:
         """Install the vaultlocker snap if it is not already installed."""
@@ -146,14 +160,93 @@ class VaultlockerCharm(ops.CharmBase):
         if not config_path.is_file():
             return
 
-        logger.info(
-            "%d device request(s) from %s will be processed",
-            len(requests),
-            requesting_unit.name,
-        )
+        self._process_device_requests(device_relation, requests, config_path)
+
+    def _process_device_requests(self, relation, requests, config_path) -> None:
+        """Process device requests and publish successful results."""
+        results: list[DeviceResult] = []
+
+        for request in requests:
+            state = self._metadata.get(request.target)
+
+            if state is not None and state.completed:
+                if state.mapper_path is None or state.luks_uuid is None:
+                    raise RuntimeError(
+                        f"completed state for {request.target} is missing result fields"
+                    )
+                results.append(
+                    DeviceResult(
+                        target=request.target,
+                        mapper_path=state.mapper_path,
+                        luks_uuid=state.luks_uuid,
+                    )
+                )
+                continue
+
+            request_type = (
+                REQUEST_TYPE_ENROLL if request.existing_key_secret_id else REQUEST_TYPE_ENCRYPT
+            )
+
+            try:
+                result = self._provision_device(request, config_path, request_type)
+            except vaultlocker_cli.VaultlockerCliError as error:
+                self._metadata.record_failure(
+                    request.target,
+                    request_type,
+                    str(error),
+                )
+                logger.error("Unable to provision %s: %s", request.target, error)
+                continue
+
+            self._metadata.mark_completed(
+                request.target,
+                request_type,
+                result.uuid,
+                result.mapper_path,
+            )
+            results.append(
+                DeviceResult(
+                    target=request.target,
+                    mapper_path=result.mapper_path,
+                    luks_uuid=result.uuid,
+                )
+            )
+
+        self.encrypted_device.set_device_results(relation, results)
+
+    def _provision_device(
+        self, request, config_path, request_type
+    ) -> vaultlocker_cli.VaultlockerResult:
+        """Run the required vaultlocker operation for a single request."""
+        if request_type == REQUEST_TYPE_ENROLL:
+            passphrase = self._get_existing_passphrase(request.existing_key_secret_id)
+            return vaultlocker_cli.run_enroll(request.target, config_path, passphrase)
+
+        return vaultlocker_cli.run_encrypt(request.target, config_path)
+
+    def _get_existing_passphrase(self, secret_id: str | None) -> str:
+        """Read the existing LUKS passphrase from an operator-provided secret."""
+        if not secret_id:
+            raise vaultlocker_cli.VaultlockerCliError("existing key secret id is missing")
+
+        try:
+            secret = self.model.get_secret(id=secret_id)
+            content = secret.get_content(refresh=True)
+        except ops.ModelError as error:
+            raise vaultlocker_cli.VaultlockerCliError(
+                f"Unable to read existing key secret: {error}",
+            ) from error
+
+        passphrase = content.get("passphrase")
+        if not passphrase:
+            raise vaultlocker_cli.VaultlockerCliError(
+                "existing key secret does not contain a passphrase",
+            )
+
+        return passphrase
 
     def _on_secret_changed(self, event: ops.SecretChangedEvent):
-        """Update configuration when the Vault credentials change."""
+        """Update Vault credentials or retry enrollment when its secret changes."""
         relation = self.model.get_relation(VAULT_KV_RELATION)
         if relation is None or relation.app is None:
             return
@@ -163,6 +256,9 @@ class VaultlockerCharm(ops.CharmBase):
 
         credentials_secret_id = self.vault_kv.get_unit_credentials(relation)
         if not credentials_secret_id or event.secret.id != credentials_secret_id:
+            # A changed passphrase secret may allow a failed enrollment to succeed.
+            if event.secret.id is not None and self._is_enrollment_secret(event.secret.id):
+                self._reconcile_encrypted_device_requests()
             return
 
         if not self._write_vault_config(relation):
@@ -170,6 +266,23 @@ class VaultlockerCharm(ops.CharmBase):
             event.defer()
             return
         self._reconcile_encrypted_device_requests()
+
+    def _is_enrollment_secret(self, secret_id: str) -> bool:
+        """Return whether a current device request uses this passphrase secret."""
+        relation = self.model.get_relation(ENCRYPTED_DEVICE_RELATION)
+        if relation is None or not relation.active:
+            return False
+
+        requesting_unit = next(iter(relation.units), None)
+        if requesting_unit is None:
+            return False
+
+        try:
+            requests = self.encrypted_device.get_device_requests(relation, requesting_unit)
+        except ValueError:
+            return False
+
+        return any(request.existing_key_secret_id == secret_id for request in requests)
 
     def _on_collect_vault_status(self, event: ops.CollectStatusEvent):
         """Report status using the current Vault relation data."""
