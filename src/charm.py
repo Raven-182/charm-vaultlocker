@@ -325,7 +325,7 @@ class VaultlockerCharm(ops.CharmBase):
             return
 
         try:
-            self.encrypted_device.get_device_requests(
+            requests = self.encrypted_device.get_device_requests(
                 relation,
                 principal_unit,
             )
@@ -333,6 +333,26 @@ class VaultlockerCharm(ops.CharmBase):
             event.add_status(
                 ops.BlockedStatus(f"Invalid encrypted-device requests from {principal_unit.name}")
             )
+            return
+
+        self._report_device_failures(event, requests)
+
+    def _report_device_failures(self, event: ops.CollectStatusEvent, requests) -> None:
+        """Report failures for currently requested devices."""
+        failures = []
+        for request in requests:
+            state = self._metadata.get(request.target)
+            if state is not None and state.last_failure is not None:
+                failures.append(state.last_failure)
+
+        if not failures:
+            return
+
+        event.add_status(
+            ops.BlockedStatus(
+                f"{len(failures)} device request(s) failed; see the charm logs for details"
+            )
+        )
 
     def _request_vault_credentials(self, relation: ops.Relation):
         """Request credentials for this unit."""

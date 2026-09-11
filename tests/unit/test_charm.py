@@ -624,3 +624,37 @@ class TestDeviceReconciliation:
                 "luks_uuid": "uuid-2",
             }
         }
+
+    def test_status_blocked_on_recorded_failure(self, ctx, metadata_store):
+        """A recorded device failure blocks the unit."""
+        create_vault_config_files()
+        metadata_store.record_failure(DEVICE_TARGET, "encrypt", "vault down")
+        device_relation = encrypted_device_relation(json.dumps({DEVICE_TARGET: {}}))
+        state_in = self._state(device_relation)
+
+        state_out = ctx.run(ctx.on.update_status(), state_in)
+
+        assert state_out.unit_status == testing.BlockedStatus(
+            "1 device request(s) failed; see the charm logs for details"
+        )
+
+    def test_status_active_without_failures(self, ctx):
+        """No device failures leaves the unit active."""
+        create_vault_config_files()
+        device_relation = encrypted_device_relation(json.dumps({DEVICE_TARGET: {}}))
+        state_in = self._state(device_relation)
+
+        state_out = ctx.run(ctx.on.update_status(), state_in)
+
+        assert state_out.unit_status == VAULT_READY_STATUS
+
+    def test_status_ignores_failures_for_unrequested_devices(self, ctx, metadata_store):
+        """Failures for unrequested devices do not affect status."""
+        create_vault_config_files()
+        metadata_store.record_failure("/dev/disk/by-id/other", "encrypt", "vault down")
+        device_relation = encrypted_device_relation(json.dumps({DEVICE_TARGET: {}}))
+        state_in = self._state(device_relation)
+
+        state_out = ctx.run(ctx.on.update_status(), state_in)
+
+        assert state_out.unit_status == VAULT_READY_STATUS
