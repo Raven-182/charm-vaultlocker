@@ -9,6 +9,8 @@ import configparser
 import json
 from unittest import mock
 
+import pytest
+from charmlibs import snap
 from ops import testing
 
 import vaultlocker
@@ -90,12 +92,37 @@ class TestVaultlockerCharm:
 
     def test_install_without_vault_kv_creates_nonce_and_blocks(self, ctx):
         """Install creates a unit nonce and blocks until Vault is related."""
-        state_out = ctx.run(ctx.on.install(), testing.State())
+        with mock.patch("charm.snap.install"):
+            state_out = ctx.run(ctx.on.install(), testing.State())
 
         secret = state_out.get_secret(label=NONCE_SECRET_LABEL)
         assert secret.owner == "unit"
         assert secret.tracked_content["nonce"]
         assert state_out.unit_status == MISSING_VAULT_RELATION_STATUS
+
+    def test_install_installs_vaultlocker_snap(self, ctx):
+        """Install installs the vaultlocker snap from the default channel."""
+        with mock.patch("charm.snap.install") as install:
+            state_out = ctx.run(ctx.on.install(), testing.State())
+
+        install.assert_called_once_with("vaultlocker", channel="latest/stable")
+        assert state_out.unit_status == MISSING_VAULT_RELATION_STATUS
+
+    def test_install_respects_configured_channel(self, ctx):
+        """Install uses the configured snap channel."""
+        with mock.patch("charm.snap.install") as install:
+            ctx.run(
+                ctx.on.install(),
+                testing.State(config={"snap-channel": "edge"}),
+            )
+
+        install.assert_called_once_with("vaultlocker", channel="edge")
+
+    def test_install_snap_failure_fails_hook(self, ctx):
+        """A snapd failure fails the install hook."""
+        with mock.patch("charm.snap.install", side_effect=snap.Error("snapd unavailable")):
+            with pytest.raises(snap.Error, match="snapd unavailable"):
+                ctx.run(ctx.on.install(), testing.State())
 
     def test_vault_kv_joined_requests_credentials(self, ctx):
         """Joining Vault publishes the credential request and sets Waiting."""

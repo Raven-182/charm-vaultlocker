@@ -8,6 +8,7 @@ import logging
 import secrets
 
 import ops
+from charmlibs import snap
 from charms.vault_k8s.v0 import vault_kv
 from vaultlocker_interfaces.encrypted_device import (
     DeviceRequestsChangedEvent,
@@ -22,6 +23,8 @@ VAULT_KV_RELATION = "vault-kv"
 ENCRYPTED_DEVICE_RELATION = "encrypted-device"
 VAULT_KV_MOUNT_SUFFIX = "keys"
 NONCE_SECRET_LABEL = "vault-kv-nonce"
+VAULTLOCKER_SNAP = "vaultlocker"
+SNAP_CHANNEL_CONFIG = "snap-channel"
 
 
 class VaultlockerCharm(ops.CharmBase):
@@ -72,6 +75,15 @@ class VaultlockerCharm(ops.CharmBase):
     def _on_install(self, _: ops.InstallEvent):
         """Handle charm installation."""
         self._get_or_create_nonce()
+        self._install_vaultlocker_snap()
+
+    def _install_vaultlocker_snap(self) -> None:
+        """Install the vaultlocker snap if it is not already installed."""
+        channel = str(self.config[SNAP_CHANNEL_CONFIG])
+        snap.install(
+            VAULTLOCKER_SNAP,
+            channel=channel,
+        )
 
     def _on_vault_kv_connected(self, event: vault_kv.VaultKvConnectedEvent):
         """Handle a connected vault-kv relation."""
