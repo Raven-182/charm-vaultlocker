@@ -7,11 +7,12 @@
 
 import configparser
 import json
+from unittest import mock
 
 from ops import testing
 
 import vaultlocker
-from charm import NONCE_SECRET_LABEL
+from charm import NONCE_SECRET_LABEL, VaultlockerCharm
 
 DEVICE_TARGET = "/dev/disk/by-id/device-a"
 NONCE = "test-nonce"
@@ -301,4 +302,32 @@ class TestVaultlockerCharm:
             state_in,
         )
 
+        assert state_out.unit_status == VAULT_READY_STATUS
+
+    def test_vault_ready_reconciles_pending_device_requests(self, ctx):
+        """Previously received device requests are retried after vault becomes ready."""
+        vault_relation = ready_vault_kv_relation()
+        device_relation = encrypted_device_relation(json.dumps({DEVICE_TARGET: {}}))
+        state_in = testing.State(
+            relations=[vault_relation, device_relation],
+            secrets=[
+                vault_kv_nonce_secret(),
+                vault_kv_credentials_secret(),
+            ],
+            unit_status=WAITING_FOR_VAULT_STATUS,
+        )
+
+        with mock.patch.object(
+            VaultlockerCharm,
+            "_reconcile_encrypted_device_requests",
+        ) as reconcile:
+            state_out = ctx.run(
+                ctx.on.relation_changed(
+                    vault_relation,
+                    remote_unit=0,
+                ),
+                state_in,
+            )
+
+        reconcile.assert_called_once()
         assert state_out.unit_status == VAULT_READY_STATUS
