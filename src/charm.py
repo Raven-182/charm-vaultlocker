@@ -45,13 +45,12 @@ class VaultlockerCharm(ops.CharmBase):
             self._on_secret_changed,
         )
         framework.observe(
-            self.on.update_status,
-            self._on_update_status,
-        )
-        framework.observe(
             self.on.collect_unit_status,
             self._on_collect_vault_status,
         )
+        # There are intentionally no cleanup handlers for vault relation removal or
+        # charm removal. The boot-unlock service operates outside of the charm lifecycle
+        # and may still need the vault credentials to unlock registered devices.
 
     def _on_install(self, _: ops.InstallEvent):
         """Handle charm installation."""
@@ -63,26 +62,32 @@ class VaultlockerCharm(ops.CharmBase):
 
     def _on_vault_kv_ready(self, event: vault_kv.VaultKvReadyEvent):
         """Handle the vault-kv relation ready."""
-        self._write_vault_config(event.relation)
+        # A deferred ready event could have been replayed after the relation is removed.
+        if not event.relation.active:
+            return
+
+        if not self._write_vault_config(event.relation):
+            # Vault information may be temporarily unavailable, so try again later.
+            event.defer()
+            return
 
     def _on_secret_changed(self, event: ops.SecretChangedEvent):
         """Update configuration when the Vault credentials change."""
         relation = self.model.get_relation(VAULT_KV_RELATION)
-        if relation is None:
+        if relation is None or relation.app is None:
+            return
+
+        if not vault_kv.is_provider_data_valid(relation.data[relation.app]):
             return
 
         credentials_secret_id = self.vault_kv.get_unit_credentials(relation)
         if not credentials_secret_id or event.secret.id != credentials_secret_id:
             return
 
-        self._write_vault_config(relation)
-
-    def _on_update_status(self, _: ops.UpdateStatusEvent):
-        """Handle status updates.."""
-        # Refresh the Vault credential request using current network information.
-        relation = self.model.get_relation(VAULT_KV_RELATION)
-        if relation is not None:
-            self._request_vault_credentials(relation)
+        if not self._write_vault_config(relation):
+            # The updated credentials may not be available yet, so try again later.
+            event.defer()
+            return
 
     def _on_collect_vault_status(self, event: ops.CollectStatusEvent):
         """Report status using the current Vault relation data."""
@@ -101,6 +106,14 @@ class VaultlockerCharm(ops.CharmBase):
 
         if self._get_vault_credentials(relation) is None:
             event.add_status(ops.WaitingStatus("Waiting for Vault credentials"))
+            return
+
+        config_dir = vaultlocker.CONFIG_PATH / self.app.name
+        config_path = config_dir / "vaultlocker.conf"
+        ca_path = config_dir / "vault-ca.pem"
+
+        if not config_path.is_file() or not ca_path.is_file():
+            event.add_status(ops.WaitingStatus("Waiting for Vault configuration"))
             return
 
         event.add_status(ops.ActiveStatus("Vault integration ready"))
@@ -134,23 +147,23 @@ class VaultlockerCharm(ops.CharmBase):
 
         return secret.get_content(refresh=True)["nonce"]
 
-    def _write_vault_config(self, relation: ops.Relation) -> None:
-        """Write Vaultlocker configuration from vault-kv relation data."""
+    def _write_vault_config(self, relation: ops.Relation) -> bool:
+        """Write Vaultlocker configuration and return whether it succeeded."""
         provider_data = relation.data[relation.app]
 
         if not vault_kv.is_provider_data_valid(provider_data):
-            return
+            return False
 
         vault_url = self.vault_kv.get_vault_url(relation)
         ca_certificate = self.vault_kv.get_ca_certificate(relation)
         mount = self.vault_kv.get_mount(relation)
 
         if vault_url is None or ca_certificate is None or mount is None:
-            return
+            return False
 
         credentials = self._get_vault_credentials(relation, refresh=True)
         if credentials is None:
-            return
+            return False
 
         vaultlocker.write_vault_configuration(
             vaultlocker.CONFIG_PATH / self.app.name,
@@ -160,6 +173,7 @@ class VaultlockerCharm(ops.CharmBase):
             role_id=credentials["role-id"],
             role_secret_id=credentials["role-secret-id"],
         )
+        return True
 
     def _get_vault_credentials(
         self, relation: ops.Relation, refresh: bool = False

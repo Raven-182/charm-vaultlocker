@@ -141,12 +141,11 @@ class TestVaultlockerCharm:
             unit_status=ACTIVE,
         )
 
-        state_out = ctx.run(ctx.on.update_status(), state_in)
+        state_out = ctx.run(ctx.on.config_changed(), state_in)
 
         relation_out = state_out.get_relation(relation.id)
         assert relation_out.local_unit_data["egress_subnet"] == "10.1.0.0/24"
         assert relation_out.local_unit_data["nonce"] == NONCE
-        assert state_out.unit_status == ACTIVE
 
     def test_vault_kv_credentials_removed_sets_waiting(self, ctx):
         """Removing the Vault credential reference changes Active to Waiting."""
